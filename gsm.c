@@ -4,14 +4,22 @@
 #include <linux/syscalls.h>
 #include <linux/uaccess.h>
 #include <linux/proc_fs.h>
+#include <crypto/hash.h>
 #include <linux/timer.h>
 #include <linux/jiffies.h>
 #include <crypto/hash.h>     // for the sha256
 #include <linux/xattr.h>     // For reading the tags (GSM_PROTECTED)
 #include <linux/file.h>      // For manipulating the files structure
+#include <linux/device.h>
+#include <linux/wait.h>
+#include <linux/sched/signal.h>
+#include <linux/string.h>
+#include "gsm_shared.h"
 
 #define TARGET_SYSCALL_WRITE __NR_write
 #define TARGET_SYSCALL __NR_unlinkat
+#define TARGET_SYSCALL_EXECVE __NR_execve
+#define TARGET_SYSCALL_EXECVEAT __NR_execveat
 #define GSM_PASSWORD "luke123"
 #define UNLOCK_TIME_SEC 60
 
@@ -21,12 +29,76 @@ static int password_set = 0;
 static struct timer_list unlock_timer;
 static unsigned long *sys_call_table_ptr;
 
-
 typedef asmlinkage long (*t_sys_unlinkat)(const struct pt_regs *);
 typedef asmlinkage long (*t_sys_write)(const struct pt_regs *);
+typedef asmlinkage long (*t_sys_execve)(const struct pt_regs *);
+typedef asmlinkage long (*t_sys_execveat)(const struct pt_regs *);
 
 static t_sys_unlinkat original_unlinkat;
 static t_sys_write original_write;
+static t_sys_execve original_execve;
+static t_sys_execveat original_execveat;
+
+// Variables for daemon communication
+static int major_number;
+static struct class *gsm_class = NULL;
+static struct device *gsm_device = NULL;
+
+static gsm_event_t current_event;
+static int data_ready = 0;
+DECLARE_WAIT_QUEUE_HEAD(wq);
+
+// Functiony to awake te daemon
+void gsm_notify_daemon(const char *path, int action) {
+    current_event.pid = current->pid;
+    current_event.uid = from_kuid(&init_user_ns, current_uid());
+    current_event.action_taken = action;
+    get_task_comm(current_event.process_name, current);
+    strncpy(current_event.target_path, path, 256);
+    
+    data_ready = 1;
+    wake_up_interruptible(&wq);
+}
+
+// Function to kill the process (Reciving by the daemon)
+void kill_malicious_process(int pid) {
+    struct task_struct *task;
+    struct pid *pid_struct = find_get_pid(pid);
+    if (pid_struct) {
+        task = get_pid_task(pid_struct, PIDTYPE_PID);
+        if (task) {
+            kill_pid(pid_struct, SIGKILL, 1);
+            printk(KERN_ALERT "GSM: Process %d killed because it was marked as a threat!\n", pid);
+            put_task_struct(task);
+        } 
+        put_pid(pid_struct);
+    }
+}
+
+// Device operations (/dev/gsm) 
+static ssize_t dev_read(struct file *filep, char __user *buffer, size_t len, loff_t *offset) {
+    if (len < sizeof(gsm_event_t)) return -EINVAL;
+    if (wait_event_interruptible(wq, data_ready == 1)) return -ERESTARTSYS;
+    if (copy_to_user(buffer, &current_event, sizeof(gsm_event_t)) != 0) return -EFAULT;
+    data_ready = 0;
+    return sizeof(gsm_event_t);
+}
+
+static ssize_t dev_write(struct file *filep, const char __user *buffer, size_t len, loff_t *offset) {
+    int pid_to_kill;
+    char kbuf[16];
+    if (len > sizeof(kbuf) - 1) return -EINVAL;
+    if (copy_from_user(kbuf, buffer, len)) return -EFAULT;
+    kbuf[len] = '\0';
+    pid_to_kill = simple_strtol(kbuf, NULL, 10);
+    if (pid_to_kill > 0) kill_malicious_process(pid_to_kill);
+    return len;
+}
+
+static struct file_operations fops = {
+    .read = dev_read,
+    .write = dev_write,
+};
 
 static int calculate_sha256(const char *input, u8 *output) {
     struct crypto_shash *alg;
@@ -82,7 +154,6 @@ static ssize_t gsm_proc_write(struct file *file, const char __user *ubuf, size_t
             printk(KERN_WARNING "GSM: Incorrect Password!\n");
         }
     }
-
     return count;
 }
 
@@ -90,15 +161,105 @@ static const struct proc_ops gsm_proc_fops = {
     .proc_write = gsm_proc_write,
 };
 
+// Kprobe handlers
+static int handle_pre_vfs_open(struct kprobe *p, struct pt_regs *regs) {
+    struct path *path = (struct path *)regs->di;
+    char buffer[256];
+    char *tpath = d_path(path, buffer, 256);
+    
+    if (!IS_ERR(tpath)) {
+         if (strncmp(tpath, "/dev", 4) != 0 && strncmp(tpath, "/proc", 5) != 0) {
+             gsm_notify_daemon(tpath, 1); // 1 = monitoring action
+         }
+    }
+    return 0;
+}
+
+// Kprobe for process execution monitoring (from gsmc.c)
+static int handle_pre_do_execve(struct kprobe *p, struct pt_regs *regs) {
+    char name[16];
+    get_task_comm(name, current);
+    
+    // Check for suspicious processes
+    if (strstr(name, "malware") || strstr(name, "hack")) {
+        printk(KERN_ALERT "GSM: Suspicious process detected: %s (PID: %d)\n", name, current->pid);
+        gsm_notify_daemon(name, 0); // 0 = suspicious action
+    }
+    return 0;
+}
+
+static struct kprobe kp_open = {
+    .symbol_name = "vfs_open",
+    .pre_handler = handle_pre_vfs_open
+};
+
+static struct kprobe kp_execve = {
+    .symbol_name = "do_execve",
+    .pre_handler = handle_pre_do_execve
+};
+
+// Check if file is marked as malicious
+static int is_file_malicious(const char *filename) {
+    struct file *f;
+    char value[16];
+    int ret = 0;
+
+    if (!filename || strlen(filename) == 0) return 0;
+
+    f = filp_open(filename, O_RDONLY, 0);
+    if (IS_ERR(f)) {
+        // We don't log every fail to avoid spam, but it might fail for relative paths
+        return 0;
+    }
+
+    ret = vfs_getxattr(&nop_mnt_idmap, f->f_path.dentry, GSM_MALICIOUS_TAG, value, sizeof(value));
+    fput(f);
+
+    if (ret > 0 && value[0] == '1') {
+        return 1;
+    }
+    return 0;
+}
+
+asmlinkage long gsm_execve(const struct pt_regs *regs) {
+    char __user *filename = (char *)regs->di;
+    char buf[256];
+    
+    if (copy_from_user(buf, filename, sizeof(buf)) == 0) {
+        // Log every execution attempt for debugging
+        if (is_file_malicious(buf)) {
+            printk(KERN_ALERT "GSM [BLOCK] execve: %s (MALWARE DETECTED)\n", buf);
+            gsm_notify_daemon(buf, 2); 
+            return -EACCES;
+        }
+    }
+    return original_execve(regs);
+}
+
+asmlinkage long gsm_execveat(const struct pt_regs *regs) {
+    char __user *filename = (char *)regs->si; 
+    char buf[256];
+    
+    if (copy_from_user(buf, filename, sizeof(buf)) == 0) {
+        if (is_file_malicious(buf)) {
+            printk(KERN_ALERT "GSM [BLOCK] execveat: %s (MALWARE DETECTED)\n", buf);
+            gsm_notify_daemon(buf, 2); 
+            return -EACCES;
+        }
+    }
+    return original_execveat(regs);
+}
+
 // Hook of the Syscall
 asmlinkage long gsm_unlinkat(const struct pt_regs *regs) {
     char __user *filename = (char *)regs->si;
     char buf[256];
     if (gsm_locked && copy_from_user(buf, filename, sizeof(buf)) == 0) {
-        if (strstr(buf, "luke") || strstr(buf, "/etc/")) {
-            printk(KERN_ALERT "GSM BLOCKED: %s tried to delete %s!\n", current->comm, buf);
-            return -EACCES;
-        }
+        // if (strstr(buf, "luke") || strstr(buf, "/etc/")) {
+        printk(KERN_ALERT "GSM BLOCKED: %s tried to delete %s!\n", current->comm, buf);
+        gsm_notify_daemon(buf, 0); // notify the daemon of the blocking
+        return -EACCES;
+        // }
     }
     return original_unlinkat(regs);
 }
@@ -115,19 +276,21 @@ static int is_file_protected(struct file *f) {
     return 0;
 }
 
-
 asmlinkage long gsm_write(const struct pt_regs *regs) {
     int fd = (int)regs->di;
     struct file *f = fget(fd);
-    int protected = 0;
+    // int protected = 0;
     
     if (strcmp(current->comm, "tee") == 0 || strcmp(current->comm, "gsm_manager") == 0) {
         return original_write(regs);
     }
     
     if (gsm_locked && f) {
-        protected = is_file_protected(f);
-        if (protected) {
+        if (is_file_protected(f)) {
+            char buffer[256];
+            char *tpath = d_path(&f->f_path, buffer, 256);
+            if (!IS_ERR(tpath)) gsm_notify_daemon(tpath, 0);
+            
             fput(f);
             printk(KERN_ALERT "GSM: Writing blocked in a protected file!\n");
             return -EACCES;
@@ -157,7 +320,19 @@ static unsigned long get_syscall_table(void) {
 
 static int __init gsm_init(void) {
     sys_call_table_ptr = (unsigned long *)get_syscall_table();
-    if (!sys_call_table_ptr) return -1;
+    if (!sys_call_table_ptr) 
+        return -1;
+    
+    // start the device
+    major_number = register_chrdev(0, DEVICE_NAME, &fops);
+    gsm_class = class_create(CLASS_NAME);
+    
+    gsm_device = device_create(gsm_class, NULL, MKDEV(major_number, 0), NULL, DEVICE_NAME);
+    
+    // Register kprobes for file operations and process execution
+    register_kprobe(&kp_open);
+    register_kprobe(&kp_execve);
+    
     // create a entry
     proc_create("gsm_control", 0222, NULL, &gsm_proc_fops);
     // Timer config
@@ -168,9 +343,14 @@ static int __init gsm_init(void) {
     original_write = (t_sys_write)sys_call_table_ptr[TARGET_SYSCALL_WRITE];
     sys_call_table_ptr[TARGET_SYSCALL_WRITE] = (unsigned long)gsm_write;
     
-    // Timer config
     original_unlinkat = (t_sys_unlinkat)sys_call_table_ptr[TARGET_SYSCALL];
     sys_call_table_ptr[TARGET_SYSCALL] = (unsigned long)gsm_unlinkat;
+    
+    original_execve = (t_sys_execve)sys_call_table_ptr[TARGET_SYSCALL_EXECVE];
+    sys_call_table_ptr[TARGET_SYSCALL_EXECVE] = (unsigned long)gsm_execve;
+    
+    original_execveat = (t_sys_execveat)sys_call_table_ptr[TARGET_SYSCALL_EXECVEAT];
+    sys_call_table_ptr[TARGET_SYSCALL_EXECVEAT] = (unsigned long)gsm_execveat;
     
     protect_memory();
     printk(KERN_INFO "GSM: General Security Manager Started and locked.\n");
@@ -178,12 +358,24 @@ static int __init gsm_init(void) {
 }
 
 static void __exit gsm_exit(void) {
+    unregister_kprobe(&kp_open);
+    unregister_kprobe(&kp_execve);
+    
     unprotected_memory();
     sys_call_table_ptr[TARGET_SYSCALL] = (unsigned long)original_unlinkat;
     sys_call_table_ptr[TARGET_SYSCALL_WRITE] = (unsigned long)original_write;
+    sys_call_table_ptr[TARGET_SYSCALL_EXECVE] = (unsigned long)original_execve;
+    sys_call_table_ptr[TARGET_SYSCALL_EXECVEAT] = (unsigned long)original_execveat;
     protect_memory();
+    
     del_timer(&unlock_timer);
     remove_proc_entry("gsm_control", NULL);
+    
+    device_destroy(gsm_class, MKDEV(major_number, 0));
+    class_unregister(gsm_class);
+    class_destroy(gsm_class);
+    unregister_chrdev(major_number, DEVICE_NAME);
+    
     printk(KERN_INFO "GSM: General Security Manager Finished.\n");
 }
 
