@@ -1,62 +1,58 @@
-# GSM - General Security Manager
+# GSM - General Security Manager & Real-time Antivirus
 
-**GSM** or **Geral Security Manager* is a proactive security module for the Linux Kernel (tested on version 6.6.9) designed to protect files and directories from unauthorized deletion or modification. It operates by intercepting system calls (Syscall Hooking) and utilizing filesystem extended attributes (xattr).
+**GSM** is a proactive security module for the Linux Kernel and a real-time antivirus daemon. It protects files from unauthorized modification/deletion and prevents the execution of known malware by combining Syscall Hooking, SHA-256 validation, and Extended Attributes (xattr).
 
 ## Key Features
 
-*   **Metadata-Based Protection**: Protect any file or folder by simply adding the `user.gsm_protected=1` flag.
-*   **Write Hook (`sys_write`)**: Prevents any changes to the content of protected files, in addition to preventing deletion.
-*   **Cryptographic Security**: Passwords are no longer stored in plain text. GSM uses **SHA-256** hashing to validate access within the RAM.
-*   **Volatile Persistence**: The password is set upon the first use after booting and resides only in the Kernel's protected memory space.
-*   **Auto-Lock Timer**: Once unlocked, the system automatically re-arms its protection after 60 seconds.
+*   **Real-time Antivirus Scanning**: Automatically scans files upon creation or access and compares their SHA-256 hash against a malware database.
+*   **Execution Blocking**: Intercepts `execve` and `execveat` syscalls to prevent programs marked with the `user.gsm_malicious` tag from running.
+*   **Metadata-Based Protection**: Lock any file or folder by adding the `user.gsm_protected=1` flag, making it impossible to delete or modify.
+*   **Interactive Management Menu**: User-space daemon (`gsmc`) with a built-in menu to manage Virus Lists, Whitelists, and Protection tags.
+*   **Stealth Monitoring**: High-performance monitoring with adjustable verbosity and a dynamic whitelist to ignore system noise (e.g., `/usr/share`, `/proc`).
+*   **Cryptographic Security**: GSM uses SHA-256 hashing to validate the unlock password within the RAM.
+*   **Auto-Lock Timer**: Once unlocked, the system automatically re-arms its file protection after 60 seconds.
 
 ## Usage
 
 ### 1. Installation and Loading
-Compile the module and insert it into the Kernel:
-```
+Compile the module and the management daemon:
+```bash
 make
 sudo insmod gsm.ko
 ```
 
-2. Setting the Password (First Use)
-
-After loading the module, define your security password. This will be hashed and stored in volatile memory.  
-
+### 2. Starting the Antivirus Daemon
+Run the interactive daemon to start monitoring and manage your lists:
+```bash
+sudo ./gsmc
 ```
+
+### 3. Management Menu Options
+*   **1. Start Monitoring**: Enters real-time scanning mode. Only threats are shown by default (Stealth Mode). Press `Ctrl+C` to return to the menu.
+*   **2. Toggle Verbose Mode**: When ON, shows every file being scanned, including safe ones.
+*   **3. Virus List**: Add or remove SHA-256 hashes of known threats.
+*   **4. Whitelist**: Manage paths that the scanner should ignore (e.g., system libraries, icon folders).
+*   **5. Blocked List**: Manually protect/unprotect files from deletion and modification.
+
+### 4. Setting the Security Password (Kernel Protection)
+Define your security password for the volatile memory. This is required to remove protection from files marked with `user.gsm_protected`.
+```bash
 echo -n "your_secret_password" | sudo tee /proc/gsm_control
 ```
 
-Note: GSM will only store the SHA-256 hash of this password.  
+## Protection Layers
 
-3. Protecting Files
+1.  **Syscall Hooking**: Interception of `unlinkat`, `write`, `execve`, and `execveat`.
+2.  **SHA-256 Guard**: User-space validation of file integrity against a malware database.
+3.  **XATTR Guard**: Real-time verification of `user.gsm_protected` and `user.gsm_malicious` attributes via `vfs_getxattr`.
 
-GSM no longer relies solely on filenames. Use extended attributes to mark targets.  
-```
-# Add protection flag
-sudo setfattr -n user.gsm_protected -v 1 /path/to/file
+## Configuration Files
+The system automatically manages these files in the `/hashes` directory:
+*   `/hashes/gsm_hashes.conf`: Database of malicious SHA-256 hashes.
+*   `/hashes/gsm_whitelist.conf`: List of paths ignored by the real-time scanner.
 
-# Verify if the tag is applied
-getfattr -d /path/to/file
-
-# Remove protection (requires the system to be unlocked)
-sudo setfattr -x user.gsm_protected /path/to/file
-```
-4. Temporary Unlocking
-To delete or edit protected files (or critical directories like /etc/), send the password again.
-```
-echo -n "your_secret_password" | sudo tee /proc/gsm_control
-```
-The system will be unlocked for a 60-second window.  
-
-# Current Protection Layers
-Syscall Hooking: Interception of unlinkat and write functions.  
-String Filtering: Native protection for any file 
-
-XATTR Guard: Real-time verification of user.gsm_protected attributes via vfs_getxattr.  
-
-# Requirements
-
-Linux Kernel 6.6.x: Support for mnt_idmap in xattrs.
-Filesystem: Must support XATTR (e.g., Ext4, XFS).
-Packages: attr package installed (sudo apt install attr).
+## Requirements
+*   **Linux Kernel 6.6.x**: Required for `mnt_idmap` support in xattrs.
+*   **Filesystem**: Must support Extended Attributes (e.g., Ext4, XFS).
+*   **Libraries**: OpenSSL (libcrypto) for SHA-256 calculations.
+*   **Packages**: `attr` package installed (`sudo apt install attr`).
