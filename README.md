@@ -1,41 +1,42 @@
-# GSM - General Security Manager & Real-time Antivirus
+# GSM - General Security Manager & Real-time Antivirus (EDR)
 
-**GSM** is a proactive security module for the Linux Kernel and a real-time antivirus daemon. It protects files from unauthorized modification/deletion and prevents the execution of known malware by combining Syscall Hooking, SHA-256 validation, and Extended Attributes (xattr).
+**GSM** is a proactive security module for the Linux Kernel and a real-time behavioral antivirus (EDR). It protects files from unauthorized modification/deletion and prevents the execution of known malware by combining Syscall Hooking, SHA-256 validation, YARA signatures, and Extended Attributes (xattr).
 
 ## Key Features
 
-*   **Real-time Antivirus Scanning**: Automatically scans files upon creation or access and compares their SHA-256 hash against a malware database.
-*   **Execution Blocking**: Intercepts `execve` and `execveat` syscalls to prevent programs marked with the `user.gsm_malicious` tag from running.
-*   **Metadata-Based Protection**: Lock any file or folder by adding the `user.gsm_protected=1` flag, making it impossible to delete or modify.
-*   **Interactive Management Menu**: User-space daemon (`gsmc`) with a built-in menu to manage Virus Lists, Whitelists, and Protection tags.
-*   **Stealth Monitoring**: High-performance monitoring with adjustable verbosity and a dynamic whitelist to ignore system noise (e.g., `/usr/share`, `/proc`).
-*   **Cryptographic Security**: GSM uses SHA-256 hashing to validate the unlock password within the RAM.
-*   **Auto-Lock Timer**: Once unlocked, the system automatically re-arms its file protection after 60 seconds.
+*   **Multi-Layer Detection**: Combines SHA-256 file hashing with **YARA Pattern Matching** to detect malware DNA even if the file is recompiled.
+*   **Automated Quarantine**: Automatically moves detected threats to the `./quarentena` folder and strips them of execution permissions.
+*   **Behavioral Monitoring (EDR)**: Marks suspicious files as `suspect`. The Kernel monitors these processes in real-time and kills them if they attempt dangerous actions (like deleting files).
+*   **Recursive Metadata Protection**: Lock any folder by adding the `user.gsm_protected=1` tag; the protection automatically extends to all files and subfolders within.
+*   **Master Safety Lock**: Hardcoded whitelist for critical system paths (`/bin`, `/etc`, `/usr`, etc.) to prevent accidental quarantine of system tools.
+*   **Interactive Management Menu**: User-space daemon (`gsmc`) to manage virus lists, whitelists, and advanced protection tags.
+*   **Auto-Lock Timer**: Security password validates unlock state in RAM, automatically re-locking file protection after 60 seconds.
 
 ## Usage
 
 ### 1. Installation and Loading
-Compile the module and the management daemon:
+Install requirements and compile the project:
 ```bash
+sudo apt install libyara-dev libssl-dev
 make
 sudo insmod gsm.ko
 ```
 
 ### 2. Starting the Antivirus Daemon
-Run the interactive daemon to start monitoring and manage your lists:
+Run the interactive daemon to start real-time monitoring:
 ```bash
 sudo ./gsmc
 ```
 
 ### 3. Management Menu Options
-*   **1. Start Monitoring**: Enters real-time scanning mode. Only threats are shown by default (Stealth Mode). Press `Ctrl+C` to return to the menu.
-*   **2. Toggle Verbose Mode**: When ON, shows every file being scanned, including safe ones.
-*   **3. Virus List**: Add or remove SHA-256 hashes of known threats.
-*   **4. Whitelist**: Manage paths that the scanner should ignore (e.g., system libraries, icon folders).
-*   **5. Blocked List**: Manually protect/unprotect files from deletion and modification.
+*   **1. Start Monitoring**: Enters real-time scanning mode. Processes YARA rules and Hashes.
+*   **2. Toggle Verbose Mode**: Shows every file being accessed, including safe system paths.
+*   **3. Virus List**: Manage SHA-256 hashes of known threats.
+*   **4. Whitelist**: Manage paths that the scanner should ignore (system paths are protected by default).
+*   **5. Blocked List**: Manage persistent protection for specific files or entire directory trees.
 
-### 4. Setting the Security Password (Kernel Protection)
-Define your security password for the volatile memory. This is required to remove protection from files marked with `user.gsm_protected`.
+### 4. Setting the Security Password
+Define your password to temporarily unlock protected files:
 ```bash
 echo -n "your_secret_password" | sudo tee /proc/gsm_control
 ```
@@ -43,16 +44,18 @@ echo -n "your_secret_password" | sudo tee /proc/gsm_control
 ## Protection Layers
 
 1.  **Syscall Hooking**: Interception of `unlinkat`, `write`, `execve`, and `execveat`.
-2.  **SHA-256 Guard**: User-space validation of file integrity against a malware database.
-3.  **XATTR Guard**: Real-time verification of `user.gsm_protected` and `user.gsm_malicious` attributes via `vfs_getxattr`.
+2.  **YARA Engine**: Scans file DNA for malicious patterns and dangerous API usage.
+3.  **Behavioral Guard**: Identifies if a process belongs to a `suspect` file and blocks harmful actions at the Kernel level.
+4.  **XATTR Guard**: Real-time verification of `user.gsm_protected`, `user.gsm_malicious`, `user.gsm_suspect`, and `user.gsm_quarantine`.
 
 ## Configuration Files
 The system automatically manages these files in the `/hashes` directory:
 *   `/hashes/gsm_hashes.conf`: Database of malicious SHA-256 hashes.
-*   `/hashes/gsm_whitelist.conf`: List of paths ignored by the real-time scanner.
+*   `/hashes/gsm_whitelist.conf`: User-defined safe paths.
+*   `/hashes/gsm_blocked.conf`: Persistent list of protected files and folders.
+*   `./YARA/`: Directory containing all `.yar` signature files.
 
 ## Requirements
-*   **Linux Kernel 6.6.x**: Required for `mnt_idmap` support in xattrs.
+*   **Linux Kernel 6.6.x**: Tested on 6.6.9.
+*   **Libraries**: `libyara` (YARA) and `libcrypto` (OpenSSL).
 *   **Filesystem**: Must support Extended Attributes (e.g., Ext4, XFS).
-*   **Libraries**: OpenSSL (libcrypto) for SHA-256 calculations.
-*   **Packages**: `attr` package installed (`sudo apt install attr`).
