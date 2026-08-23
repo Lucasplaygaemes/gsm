@@ -21,6 +21,12 @@
 #include <errno.h>
 #include <yara.h>
 #include <dirent.h>
+// ── Deep Scanner additions ─────────────────────────────────────────────────
+#include <sys/fanotify.h>   // on-access file scanning (FAN_CLOSE_WRITE)
+#include <elf.h>            // ELF format structures (section parsing)
+#include <math.h>           // log2() for Shannon entropy
+#include <limits.h>         // PATH_MAX
+// ──────────────────────────────────────────────────────────────────────────
 #include "gsm_shared.h"
 
 #define DEVICE_PATH "/dev/gsm"
@@ -51,8 +57,70 @@ static int verbose_mode = 0;
 static YR_RULES *yara_rules = NULL;
 static YR_COMPILER *yara_compiler = NULL;
 
-#define YARA_RULES_DIR "./YARA"
-#define QUARANTINE_DIR "./quarentena"
+#define YARA_RULES_DIR    "./YARA"
+#define QUARANTINE_DIR    "./quarentena"
+
+// ── Deep Scanner: Threat Scoring Thresholds ──────────────────────────────────
+#define THREAT_SCORE_MALICIOUS  80   // >= this → quarantine automatically
+#define THREAT_SCORE_SUSPECT    40   // >= this → tag as suspect, monitor
+#define MAX_SCAN_SIZE  (4 * 1024 * 1024)  // 4MB cap for string/entropy scan
+#define ENTROPY_HIGH        7.0      // > this → packed/obfuscated → +20 pts
+#define ENTROPY_VERY_HIGH   7.5      // > this → likely encrypted payload → +40 pts
+
+// ── Deep Scanner: Suspicious String Signatures ───────────────────────────────
+// Each entry has a string pattern, a threat score contribution, and a description.
+// Scores accumulate. Total >= THREAT_SCORE_MALICIOUS → quarantine.
+typedef struct { const char *pattern; int score; const char *desc; } str_sig_t;
+
+static const str_sig_t string_sigs[] = {
+    // Reverse shell / execution
+    {"/bin/sh",          25, "direct shell reference"},
+    {"bash -i",          40, "interactive bash (reverse shell pattern)"},
+    {"nc -e",            55, "netcat with exec (classic reverse shell)"},
+    {"ncat -e",          55, "ncat with exec (reverse shell)"},
+    {"/dev/tcp/",        60, "bash TCP redirect (reverse shell)"},
+    {"python -c",        30, "inline Python execution"},
+    {"perl -e",          30, "inline Perl execution"},
+    {"ruby -e",          30, "inline Ruby execution"},
+    // Privilege escalation
+    {"chmod 777",        35, "world-writable permission change"},
+    {"chmod +s",         45, "setuid/setgid bit set"},
+    {"chown root",       40, "ownership change to root"},
+    // Persistence
+    {"/etc/crontab",     35, "crontab modification"},
+    {"cron.d/",          30, "cron directory access"},
+    {".bashrc",          25, "bashrc persistence"},
+    {".bash_profile",    25, "bash_profile persistence"},
+    {"systemctl enable", 30, "systemd service enable"},
+    {"rc.local",         25, "rc.local startup persistence"},
+    // Credential theft
+    {"/etc/shadow",      55, "shadow file (credential theft)"},
+    {"/etc/passwd",      30, "passwd file access"},
+    {"id_rsa",           45, "SSH private key reference"},
+    {".ssh/",            30, "SSH directory"},
+    {"authorized_keys",  40, "SSH authorized keys modification"},
+    // Downloader / dropper
+    {"wget ",            20, "wget downloader"},
+    {"curl ",            20, "curl downloader"},
+    // Obfuscation
+    {"base64 -d",        35, "base64 decode (obfuscation)"},
+    {"base64 --decode",  35, "base64 decode (obfuscation)"},
+    {"xxd -r",           30, "hex-to-binary (obfuscation)"},
+    {"eval ",            25, "eval() style execution"},
+    // Injection / memory manipulation
+    {"ptrace",           35, "ptrace (process injection)"},
+    {"/proc/mem",        50, "direct memory access via /proc"},
+    {"LD_PRELOAD",       45, "LD_PRELOAD injection"},
+    {"LD_LIBRARY_PATH",  35, "library path manipulation"},
+    // Network
+    {"SOCK_RAW",         30, "raw socket creation"},
+    {"/etc/resolv.conf", 20, "DNS config access"},
+    {NULL, 0, NULL}  // sentinel
+};
+
+// fanotify file descriptor (set up in setup_fanotify, used in run_monitoring)
+static int fanotify_fd = -1;
+// ─────────────────────────────────────────────────────────────────────────────
 
 // helper function to copy files if rename fails (cross-device move)
 int copy_file(const char *src, const char *dst) {
@@ -87,6 +155,14 @@ void run_monitoring(int dev_fd);
 void manage_virus_list();
 void manage_whitelist();
 void manage_blocked_list();
+// deep scanner
+double calculate_entropy(const uint8_t *data, size_t len);
+double calculate_file_entropy(const char *filepath);
+int    scan_suspicious_strings(const char *filepath, int *out_score);
+int    calculate_elf_text_sha256(const char *filepath, char *output_hex);
+int    scan_file_deep(const char *filepath);
+int    setup_fanotify(void);
+void   handle_fanotify_event(int fan_fd);
 
 void signal_handler(int sig) {
     if (monitoring_active) {
@@ -330,48 +406,388 @@ void handle_event(gsm_event_t *event, int dev_fd) {
         return;
     }
 
-    // 5. yara verification (behavioral signature)
-    if (yara_rules != NULL) {
-        yr_rules_scan_file(yara_rules, event->target_path, 0, yar_callback, (void*)event->target_path, 0);
+    // 5. network block (edr — reverse shell / C2 prevention)
+    if (event->action_taken == 4) {
+        char exe_link[64], exe_path[256];
+        snprintf(exe_link, sizeof(exe_link), "/proc/%d/exe", event->pid);
+        ssize_t len = readlink(exe_link, exe_path, sizeof(exe_path) - 1);
+        if (len > 0) exe_path[len] = '\0';
+        else strncpy(exe_path, event->target_path, sizeof(exe_path) - 1);
+
+        printf("\n[%s] \033[1;31m[!!! NETWORK BLOCK !!!]\033[0m pid %d (%s)\n",
+               timestamp, event->pid, event->process_name);
+        printf("  connection attempt: %s\n", event->target_path);
+        printf("  binary:             %s\n", exe_path);
+        printf("[gsmc] action: killing process and quarantining binary...\n");
+
+        // kill the suspect process immediately via kernel
+        char pidstr[16];
+        int slen = snprintf(pidstr, sizeof(pidstr), "%d", event->pid);
+        write(dev_fd, pidstr, slen);
+        usleep(50000);
+
+        // quarantine the binary (unless it's a shell/interpreter)
+        if (strstr(exe_path, "/bin/bash") || strstr(exe_path, "/bin/sh") ||
+            strstr(exe_path, "/usr/bin/python") || strstr(exe_path, "/usr/bin/perl")) {
+            printf("[gsmc] suspect script killed (pid %d) — skipping quarantine of interpreter.\n", event->pid);
+        } else {
+            move_to_quarantine(exe_path);
+            printf("[gsmc] binary quarantined: %s\n", exe_path);
+        }
+        return;
     }
 
-    // 6. hash verification (database)
-    if (calculate_file_sha256(event->target_path, hash) == 0) {
-        for (int i = 0; i < hash_db_size; i++) {
-            if (strcmp(hash_database[i].hash, hash) == 0) {
-                db_entry = &hash_database[i];
-                break;
-            }
-        }
-        
-        if (db_entry != NULL && db_entry->threat_level >= 1) {
-            printf("\n[%s] !!! match hash: %s (malware: %s) !!!\n", timestamp, event->target_path, db_entry->name);
+    // 5–9. Unified deep scan (entropy + strings + ELF .text hash + YARA + SHA-256)
+    {
+        int score = scan_file_deep(event->target_path);
+        if (score >= THREAT_SCORE_MALICIOUS) {
+            printf("\n[%s] \033[1;31m[!!! THREAT !!!]\033[0m %s (score: %d) → quarantine\n",
+                   timestamp, event->target_path, score);
             setxattr(event->target_path, GSM_MALICIOUS_TAG, "1", 1, 0);
             move_to_quarantine(event->target_path);
-        } else if (verbose_mode && getxattr(event->target_path, GSM_SUSPECT_TAG, val, sizeof(val)) <= 0) {
-            printf("[%s] safe: %s\n", timestamp, event->target_path);
+        } else if (score >= THREAT_SCORE_SUSPECT) {
+            printf("\n[%s] \033[1;33m[? SUSPECT ?]\033[0m %s (score: %d) → monitoring\n",
+                   timestamp, event->target_path, score);
+            setxattr(event->target_path, GSM_SUSPECT_TAG, "1", 1, 0);
+        } else if (verbose_mode) {
+            printf("[%s] clean: %s\n", timestamp, event->target_path);
         }
     }
 }
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DEEP SCANNER — Anti-Virus Engine
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Calculate Shannon entropy of a byte buffer.
+// Range: 0.0 (all same byte) to 8.0 (perfectly uniform distribution).
+// High entropy (>7.0) indicates packing, encryption, or obfuscation.
+double calculate_entropy(const uint8_t *data, size_t len) {
+    if (len == 0) return 0.0;
+    size_t freq[256] = {0};
+    for (size_t i = 0; i < len; i++) freq[(unsigned char)data[i]]++;
+    double entropy = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (freq[i] > 0) {
+            double p = (double)freq[i] / (double)len;
+            entropy -= p * log2(p);
+        }
+    }
+    return entropy;
+}
+
+// Read a file (up to MAX_SCAN_SIZE bytes) and return its Shannon entropy.
+double calculate_file_entropy(const char *filepath) {
+    FILE *fp = fopen(filepath, "rb");
+    if (!fp) return 0.0;
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (fsize <= 0) { fclose(fp); return 0.0; }
+    size_t read_sz = ((size_t)fsize > MAX_SCAN_SIZE) ? MAX_SCAN_SIZE : (size_t)fsize;
+    uint8_t *buf = malloc(read_sz);
+    if (!buf) { fclose(fp); return 0.0; }
+    size_t n = fread(buf, 1, read_sz, fp);
+    fclose(fp);
+    double e = calculate_entropy(buf, n);
+    free(buf);
+    return e;
+}
+
+// Scan a file's bytes for suspicious strings (using the string_sigs database).
+// Accumulates scores for each matching pattern and returns the total.
+// Uses memmem() for binary-safe substring search (works on non-text files too).
+int scan_suspicious_strings(const char *filepath, int *out_score) {
+    *out_score = 0;
+    FILE *fp = fopen(filepath, "rb");
+    if (!fp) return -1;
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (fsize <= 0) { fclose(fp); return 0; }
+    size_t read_sz = ((size_t)fsize > MAX_SCAN_SIZE) ? MAX_SCAN_SIZE : (size_t)fsize;
+    uint8_t *buf = malloc(read_sz + 1);
+    if (!buf) { fclose(fp); return -1; }
+    size_t n = fread(buf, 1, read_sz, fp);
+    buf[n] = '\0';
+    fclose(fp);
+
+    int total = 0;
+    for (int i = 0; string_sigs[i].pattern != NULL; i++) {
+        size_t plen = strlen(string_sigs[i].pattern);
+        if (memmem(buf, n, string_sigs[i].pattern, plen) != NULL) {
+            total += string_sigs[i].score;
+            if (verbose_mode)
+                printf("    [str] +%-3d %-25s (%s)\n",
+                       string_sigs[i].score, string_sigs[i].pattern, string_sigs[i].desc);
+        }
+    }
+    free(buf);
+    *out_score = total;
+    return 0;
+}
+
+// Parse an ELF64 binary and compute SHA-256 of its .text (executable code) section.
+// This hash is immune to changes in metadata, padding, or non-code sections.
+// Returns 0 on success, -1 if not an ELF or .text not found.
+int calculate_elf_text_sha256(const char *filepath, char *output_hex) {
+    FILE *fp = fopen(filepath, "rb");
+    if (!fp) return -1;
+
+    Elf64_Ehdr ehdr;
+    if (fread(&ehdr, sizeof(ehdr), 1, fp) != 1) { fclose(fp); return -1; }
+    // check ELF magic bytes
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr.e_shstrndx == SHN_UNDEF) {
+        fclose(fp); return -1;
+    }
+
+    // read all section headers
+    Elf64_Shdr *shdrs = malloc(ehdr.e_shnum * sizeof(Elf64_Shdr));
+    if (!shdrs) { fclose(fp); return -1; }
+    fseek(fp, (long)ehdr.e_shoff, SEEK_SET);
+    if (fread(shdrs, sizeof(Elf64_Shdr), ehdr.e_shnum, fp) != ehdr.e_shnum) {
+        free(shdrs); fclose(fp); return -1;
+    }
+
+    // read section-name string table
+    Elf64_Shdr *strtab_shdr = &shdrs[ehdr.e_shstrndx];
+    char *strtab = malloc(strtab_shdr->sh_size + 1);
+    if (!strtab) { free(shdrs); fclose(fp); return -1; }
+    fseek(fp, (long)strtab_shdr->sh_offset, SEEK_SET);
+    fread(strtab, 1, strtab_shdr->sh_size, fp);
+    strtab[strtab_shdr->sh_size] = '\0';
+
+    int found = 0;
+    for (int i = 0; i < ehdr.e_shnum && !found; i++) {
+        if (shdrs[i].sh_name >= strtab_shdr->sh_size) continue;
+        const char *name = strtab + shdrs[i].sh_name;
+        if (strcmp(name, ".text") == 0 && shdrs[i].sh_size > 0) {
+            uint8_t *text = malloc(shdrs[i].sh_size);
+            if (!text) break;
+            fseek(fp, (long)shdrs[i].sh_offset, SEEK_SET);
+            fread(text, 1, shdrs[i].sh_size, fp);
+            // SHA-256 of .text only
+            unsigned char hash[SHA256_DIGEST_LENGTH];
+            SHA256_CTX ctx;
+            SHA256_Init(&ctx);
+            SHA256_Update(&ctx, text, shdrs[i].sh_size);
+            SHA256_Final(hash, &ctx);
+            for (int j = 0; j < SHA256_DIGEST_LENGTH; j++)
+                sprintf(output_hex + (j * 2), "%02x", hash[j]);
+            output_hex[64] = '\0';
+            free(text);
+            found = 1;
+        }
+    }
+    free(strtab);
+    free(shdrs);
+    fclose(fp);
+    return found ? 0 : -1;
+}
+
+// ── Main Deep Scanner Orchestrator ───────────────────────────────────────────
+// Runs all analysis layers on a file and returns a cumulative threat score.
+//   score >= THREAT_SCORE_MALICIOUS → quarantine
+//   score >= THREAT_SCORE_SUSPECT  → mark as suspect / monitor
+//   score <  THREAT_SCORE_SUSPECT  → clean
+//
+// Layers: SHA-256 hash, ELF .text hash, Shannon entropy, string heuristics, YARA
+int scan_file_deep(const char *filepath) {
+    char sha256_full[65], sha256_text[65];
+    int  total_score = 0;
+    int  string_score = 0;
+    double entropy;
+
+    // skip sockets, pipes, special files
+    struct stat st;
+    if (stat(filepath, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
+    if (st.st_size < 4) return 0; // too small to be meaningful
+
+    printf("\n[scanner] \033[1m↓ deep scan:\033[0m %s (%ld bytes)\n", filepath, (long)st.st_size);
+
+    // ── Layer 1: SHA-256 full file hash ──────────────────────────────────────
+    if (calculate_file_sha256(filepath, sha256_full) == 0) {
+        for (int i = 0; i < hash_db_size; i++) {
+            if (strcmp(hash_database[i].hash, sha256_full) == 0) {
+                printf("  [hash] \033[1;31mKNOWN MALWARE\033[0m: '%s' — score +100\n",
+                       hash_database[i].name);
+                return 100; // definitive match — skip further analysis
+            }
+        }
+        if (verbose_mode) printf("  [hash] %s  (no db match)\n", sha256_full);
+    }
+
+    // ── Layer 2: ELF .text section hash (metadata-immune) ────────────────────
+    if (calculate_elf_text_sha256(filepath, sha256_text) == 0) {
+        for (int i = 0; i < hash_db_size; i++) {
+            if (strcmp(hash_database[i].hash, sha256_text) == 0) {
+                printf("  [elf.text] \033[1;31mKNOWN MALWARE CODE SECTION\033[0m: '%s' — score +100\n",
+                       hash_database[i].name);
+                return 100;
+            }
+        }
+        if (verbose_mode) printf("  [elf.text] %s  (no db match)\n", sha256_text);
+    }
+
+    // ── Layer 3: Shannon entropy — detects packing / encryption ─────────────
+    entropy = calculate_file_entropy(filepath);
+    if (entropy >= ENTROPY_VERY_HIGH) {
+        printf("  [entropy] \033[1;31m%.4f bits\033[0m — very high, likely packed/encrypted (+40)\n", entropy);
+        total_score += 40;
+    } else if (entropy >= ENTROPY_HIGH) {
+        printf("  [entropy] \033[1;33m%.4f bits\033[0m — high, possible packing (+20)\n", entropy);
+        total_score += 20;
+    } else if (verbose_mode) {
+        printf("  [entropy] %.4f bits — normal\n", entropy);
+    }
+
+    // ── Layer 4: Suspicious string heuristics ────────────────────────────────
+    if (scan_suspicious_strings(filepath, &string_score) == 0 && string_score > 0) {
+        printf("  [strings] suspicious string score: %d\n", string_score);
+        total_score += string_score;
+    } else if (verbose_mode) {
+        printf("  [strings] no suspicious patterns found\n");
+    }
+
+    // ── Layer 5: YARA signature scan ─────────────────────────────────────────
+    if (yara_rules != NULL) {
+        yr_rules_scan_file(yara_rules, filepath, 0, yar_callback, (void*)filepath, 0);
+    }
+
+    // ── Result ────────────────────────────────────────────────────────────────
+    printf("  [score]  %d / %d (malicious) / %d (suspect)  →  ",
+           total_score, THREAT_SCORE_MALICIOUS, THREAT_SCORE_SUSPECT);
+    if      (total_score >= THREAT_SCORE_MALICIOUS) printf("\033[1;31mMALICIOUS\033[0m\n");
+    else if (total_score >= THREAT_SCORE_SUSPECT)   printf("\033[1;33mSUSPECT\033[0m\n");
+    else                                             printf("\033[1;32mCLEAN\033[0m\n");
+
+    return total_score;
+}
+
+// ── fanotify Setup ────────────────────────────────────────────────────────────
+// Watches the entire filesystem for FAN_CLOSE_WRITE events.
+// This fires whenever a file is completely written and closed — perfect for
+// catching downloaded malware the moment it lands on disk.
+int setup_fanotify(void) {
+    fanotify_fd = fanotify_init(FAN_CLASS_NOTIF, O_RDONLY);
+    if (fanotify_fd < 0) {
+        fprintf(stderr, "[gsmc] warning: fanotify_init failed (%s). on-write scanning disabled.\n",
+                strerror(errno));
+        fprintf(stderr, "[gsmc] hint: run as root with CAP_SYS_ADMIN for fanotify support.\n");
+        return -1;
+    }
+    // watch the whole filesystem — FAN_CLOSE_WRITE fires when any written file is closed
+    if (fanotify_mark(fanotify_fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                      FAN_CLOSE_WRITE, AT_FDCWD, "/") < 0) {
+        fprintf(stderr, "[gsmc] warning: fanotify_mark failed (%s). on-write scanning disabled.\n",
+                strerror(errno));
+        close(fanotify_fd);
+        fanotify_fd = -1;
+        return -1;
+    }
+    printf("[gsmc] fanotify: \033[1;32mactive\033[0m — scanning every new/modified file on close-write.\n");
+    return fanotify_fd;
+}
+
+// ── fanotify Event Handler ────────────────────────────────────────────────────
+// Called from run_monitoring() when fanotify_fd is readable.
+// Resolves the file path from the event's fd and dispatches scan_file_deep().
+void handle_fanotify_event(int fan_fd) {
+    char buf[4096];
+    ssize_t len = read(fan_fd, buf, sizeof(buf));
+    if (len <= 0) return;
+
+    struct fanotify_event_metadata *meta = (struct fanotify_event_metadata *)buf;
+    while (FAN_EVENT_OK(meta, len)) {
+        if ((meta->mask & FAN_CLOSE_WRITE) && meta->fd >= 0) {
+            char fdpath[64], filepath[PATH_MAX];
+            snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", meta->fd);
+            ssize_t plen = readlink(fdpath, filepath, sizeof(filepath) - 1);
+            close(meta->fd); // MUST close the fd from fanotify
+
+            if (plen > 0) {
+                filepath[plen] = '\0';
+
+                // skip whitelisted system paths
+                int skip = 0;
+                for (int i = 0; i < whitelist_size; i++) {
+                    if (strncmp(filepath, whitelist[i], strlen(whitelist[i])) == 0)
+                        { skip = 1; break; }
+                }
+                // skip internal GSM dirs and already-quarantined files
+                if (!skip && (strstr(filepath, "/quarentena/") ||
+                              strstr(filepath, "/YARA/")       ||
+                              strstr(filepath, "gsm"))) skip = 1;
+                // skip files already tagged
+                char xval[4];
+                if (!skip && getxattr(filepath, GSM_MALICIOUS_TAG,  xval, sizeof(xval)) > 0) skip = 1;
+                if (!skip && getxattr(filepath, GSM_QUARANTINE_TAG, xval, sizeof(xval)) > 0) skip = 1;
+
+                if (!skip) {
+                    int score = scan_file_deep(filepath);
+                    if (score >= THREAT_SCORE_MALICIOUS) {
+                        printf("[gsmc] \033[1;31m[!!! THREAT DETECTED via fanotify !!!]\033[0m %s (score: %d)\n",
+                               filepath, score);
+                        setxattr(filepath, GSM_MALICIOUS_TAG, "1", 1, 0);
+                        move_to_quarantine(filepath);
+                    } else if (score >= THREAT_SCORE_SUSPECT) {
+                        printf("[gsmc] \033[1;33m[? SUSPECT via fanotify ?]\033[0m %s (score: %d) — monitoring\n",
+                               filepath, score);
+                        setxattr(filepath, GSM_SUSPECT_TAG, "1", 1, 0);
+                    }
+                }
+            }
+        } else if (meta->fd >= 0) {
+            close(meta->fd); // always close leftover fds
+        }
+        meta = FAN_EVENT_NEXT(meta, len);
+    }
+}
+// ══════════════════════════════════════════════════════════════════════════════
 
 void run_monitoring(int dev_fd) {
     gsm_event_t event;
     monitoring_active = 1;
-    printf("\n[gsmc] monitoring started (%s mode). ctrl+c to stop.\n", verbose_mode ? "verbose" : "stealth");
+    printf("\n[gsmc] monitoring started (%s mode). ctrl+c to stop.\n",
+           verbose_mode ? "verbose" : "stealth");
+    printf("[gsmc] fanotify on-write scanner: %s\n",
+           fanotify_fd >= 0 ? "\033[1;32mACTIVE\033[0m" : "\033[1;31mINACTIVE\033[0m (needs root + CAP_SYS_ADMIN)");
+
     while (monitoring_active) {
         struct timeval tv = {1, 0};
         fd_set fds;
-        FD_ZERO(&fds); FD_SET(dev_fd, &fds);
-        if (select(dev_fd + 1, &fds, NULL, NULL, &tv) > 0) {
-            if (read(dev_fd, &event, sizeof(gsm_event_t)) == sizeof(gsm_event_t)) {
-                handle_event(&event, dev_fd);
+        FD_ZERO(&fds);
+        FD_SET(dev_fd, &fds);
+        int max_fd = dev_fd;
+
+        // also watch fanotify fd if available
+        if (fanotify_fd >= 0) {
+            FD_SET(fanotify_fd, &fds);
+            if (fanotify_fd > max_fd) max_fd = fanotify_fd;
+        }
+
+        int ret = select(max_fd + 1, &fds, NULL, NULL, &tv);
+        if (ret > 0) {
+            // handle kernel module events (/dev/gsm)
+            if (FD_ISSET(dev_fd, &fds)) {
+                if (read(dev_fd, &event, sizeof(gsm_event_t)) == sizeof(gsm_event_t)) {
+                    handle_event(&event, dev_fd);
+                }
+            }
+            // handle fanotify on-write events (new files/downloads)
+            if (fanotify_fd >= 0 && FD_ISSET(fanotify_fd, &fds)) {
+                handle_fanotify_event(fanotify_fd);
             }
         }
     }
 }
 
+
 void manage_whitelist() {
-    int choice;
+    int choice, i, found;
     char path[256];
     printf("\n--- whitelist management ---\n1. add path to whitelist\n2. remove path\n3. list whitelist\n0. back\nchoice: ");
     scanf("%d", &choice); getchar();
@@ -382,9 +798,28 @@ void manage_whitelist() {
             strncpy(whitelist[whitelist_size++], path, 255);
             save_whitelist();
             printf("path added to whitelist.\n");
+        } else {
+            printf("whitelist is full (%d entries).\n", MAX_WHITELIST);
         }
+    } else if (choice == 2) {
+        // [BUG FIX #6] This option was listed in the menu but never implemented.
+        printf("enter path to remove: ");
+        fgets(path, 256, stdin); path[strcspn(path, "\n")] = 0;
+        found = 0;
+        for (i = 0; i < whitelist_size; i++) {
+            if (strcmp(whitelist[i], path) == 0) {
+                // shift remaining entries left to fill the gap
+                memmove(whitelist[i], whitelist[i + 1], (whitelist_size - i - 1) * 256);
+                whitelist_size--;
+                save_whitelist();
+                printf("path removed from whitelist.\n");
+                found = 1;
+                break;
+            }
+        }
+        if (!found) printf("path not found in whitelist.\n");
     } else if (choice == 3) {
-        for (int i = 0; i < whitelist_size; i++) printf("%d. %s\n", i+1, whitelist[i]);
+        for (i = 0; i < whitelist_size; i++) printf("%d. %s\n", i+1, whitelist[i]);
     }
 }
 
@@ -508,19 +943,27 @@ int main() {
         return 1;
     }
 
-    printf("[gsmc] connection successful. entering menu...\n");
+    printf("[gsmc] connection successful.\n");
+
+    // initialize fanotify on-write scanner (requires root + CAP_SYS_ADMIN)
+    setup_fanotify();
+
+    printf("[gsmc] entering menu...\n");
 
     while (1) {
-        printf("\n╔════════════════════════════════════════════╗\n");
-        printf("║         gsm security manager menu          ║\n");
-        printf("╠════════════════════════════════════════════╣\n");
-        printf("║ 1. start monitoring (%-7s mode)     ║\n", verbose_mode ? "verbose" : "stealth");
-        printf("║ 2. toggle verbose mode                     ║\n");
-        printf("║ 3. virus list (hashes)                     ║\n");
-        printf("║ 4. whitelist (ignore paths)                ║\n");
-        printf("║ 5. blocked list (protect files)            ║\n");
-        printf("║ 6. exit                                    ║\n");
-        printf("╚════════════════════════════════════════════╝\nselection: ");
+        printf("\n╔══════════════════════════════════════════════════╗\n");
+        printf("║          gsm security manager menu              ║\n");
+        printf("╠══════════════════════════════════════════════════╣\n");
+        printf("║ 1. start monitoring (%-7s mode)          ║\n", verbose_mode ? "verbose" : "stealth");
+        printf("║ 2. toggle verbose mode                          ║\n");
+        printf("║ 3. virus list (hashes)                          ║\n");
+        printf("║ 4. whitelist (ignore paths)                     ║\n");
+        printf("║ 5. blocked list (protect files/folders)         ║\n");
+        printf("║ 6. exit                                         ║\n");
+        printf("╠══════════════════════════════════════════════════╣\n");
+        printf("║ active hooks: unlinkat write execve             ║\n");
+        printf("║               execveat connect sendto           ║\n");
+        printf("╚══════════════════════════════════════════════════╝\nselection: ");
         if (scanf("%d", &choice) != 1) { while(getchar() != '\n'); continue; }
         switch (choice) {
             case 1: run_monitoring(dev_fd); break;
