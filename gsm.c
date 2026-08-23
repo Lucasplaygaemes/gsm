@@ -16,11 +16,18 @@
 #include <linux/string.h>
 #include "gsm_shared.h"
 
+#include <linux/net.h>           // for socket structures (struct sockaddr)
+#include <linux/in.h>            // for AF_INET, sockaddr_in
+#include <linux/in6.h>           // for AF_INET6, sockaddr_in6
+#include <linux/inet.h>          // for in4_pton / in6_pton
+
 #define TARGET_SYSCALL_WRITE __NR_write
 #define TARGET_SYSCALL __NR_unlinkat
 #define TARGET_SYSCALL_EXECVE __NR_execve
 #define TARGET_SYSCALL_EXECVEAT __NR_execveat
-#define GSM_PASSWORD "luke123"
+#define TARGET_SYSCALL_CONNECT __NR_connect
+#define TARGET_SYSCALL_SENDTO  __NR_sendto
+// NOTE: password is set dynamically via /proc/gsm_control (first write sets it)
 #define UNLOCK_TIME_SEC 60
 
 static u8 gsm_password_hash[32]; // saves the hash instead of the pure key
@@ -36,30 +43,54 @@ typedef asmlinkage long (*t_sys_unlinkat)(const struct pt_regs *);
 typedef asmlinkage long (*t_sys_write)(const struct pt_regs *);
 typedef asmlinkage long (*t_sys_execve)(const struct pt_regs *);
 typedef asmlinkage long (*t_sys_execveat)(const struct pt_regs *);
+typedef asmlinkage long (*t_sys_connect)(const struct pt_regs *);
+typedef asmlinkage long (*t_sys_sendto)(const struct pt_regs *);
 
 static t_sys_unlinkat original_unlinkat;
 static t_sys_write original_write;
 static t_sys_execve original_execve;
 static t_sys_execveat original_execveat;
+static t_sys_connect original_connect;
+static t_sys_sendto original_sendto;
 
 // variables for daemon communication
 static int major_number;
 static struct class *gsm_class = NULL;
 static struct device *gsm_device = NULL;
 
-static gsm_event_t current_event;
-static int data_ready = 0;
+// Ring buffer thread-safe to prevent race conditions
+// Using a circular queue + spinlock instead of a single shared event variable.
+// This prevents simultaneous syscall hooks from overwriting each other's data
+// before the daemon has a chance to read it.
+#define EVENT_QUEUE_SIZE 64
+static gsm_event_t event_queue[EVENT_QUEUE_SIZE];
+static int queue_head = 0;
+static int queue_tail = 0;
+static DEFINE_SPINLOCK(event_queue_lock);
 DECLARE_WAIT_QUEUE_HEAD(wq);
 
-// function to wake up the daemon
+// function to wake up the daemon (ring buffer enqueue)
 void gsm_notify_daemon(const char *path, int action) {
-    current_event.pid = current->pid;
-    current_event.uid = from_kuid(&init_user_ns, current_uid());
-    current_event.action_taken = action;
-    get_task_comm(current_event.process_name, current);
-    strncpy(current_event.target_path, path, 256);
-    
-    data_ready = 1;
+    unsigned long flags;
+    int next_tail;
+
+    spin_lock_irqsave(&event_queue_lock, flags);
+    next_tail = (queue_tail + 1) % EVENT_QUEUE_SIZE;
+    if (next_tail == queue_head) {
+        // queue is full — drop this event to avoid overwriting unread data
+        spin_unlock_irqrestore(&event_queue_lock, flags);
+        printk(KERN_WARNING "gsm: event queue full, dropping event for %s\n", path);
+        return;
+    }
+    event_queue[queue_tail].pid = current->pid;
+    event_queue[queue_tail].uid = from_kuid(&init_user_ns, current_uid());
+    event_queue[queue_tail].action_taken = action;
+    get_task_comm(event_queue[queue_tail].process_name, current);
+    strncpy(event_queue[queue_tail].target_path, path, 255);
+    event_queue[queue_tail].target_path[255] = '\0';
+    queue_tail = next_tail;
+    spin_unlock_irqrestore(&event_queue_lock, flags);
+
     wake_up_interruptible(&wq);
 }
 
@@ -80,10 +111,19 @@ void kill_malicious_process(int pid) {
 
 // device operations (/dev/gsm) 
 static ssize_t dev_read(struct file *filep, char __user *buffer, size_t len, loff_t *offset) {
+    unsigned long flags;
+    gsm_event_t local_event;
+
     if (len < sizeof(gsm_event_t)) return -EINVAL;
-    if (wait_event_interruptible(wq, data_ready == 1)) return -ERESTARTSYS;
-    if (copy_to_user(buffer, &current_event, sizeof(gsm_event_t)) != 0) return -EFAULT;
-    data_ready = 0;
+    // wait until there is at least one event in the queue
+    if (wait_event_interruptible(wq, queue_head != queue_tail)) return -ERESTARTSYS;
+
+    spin_lock_irqsave(&event_queue_lock, flags);
+    local_event = event_queue[queue_head];
+    queue_head = (queue_head + 1) % EVENT_QUEUE_SIZE;
+    spin_unlock_irqrestore(&event_queue_lock, flags);
+
+    if (copy_to_user(buffer, &local_event, sizeof(gsm_event_t)) != 0) return -EFAULT;
     return sizeof(gsm_event_t);
 }
 
@@ -124,11 +164,14 @@ void timer_callback(struct timer_list *t) {
     printk(KERN_INFO "gsm: time finished! protection reactivated.\n");
 }
 
+// Anti-rmmod: the module blocks its own removal via try_module_get().
+// To allow rmmod, write "UNLOAD:<password>" to /proc/gsm_control.
+// This releases the self-reference and makes rmmod work again.
 // /proc interface
 static ssize_t gsm_proc_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
-    char buf[32];
+    char buf[64]; // increased from 32 to support "UNLOAD:<password>" prefix
     u8 attempt_hash[32];
-    size_t len = count > 31 ? 31 : count;
+    size_t len = count > 63 ? 63 : count;
 
     if (copy_from_user(buf, ubuf, len)) 
         return -EFAULT;
@@ -138,6 +181,22 @@ static ssize_t gsm_proc_write(struct file *file, const char __user *ubuf, size_t
     // string formatting (remove \n, \r or spaces)
     while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' || buf[len-1] == ' ')) {
         buf[--len] = '\0';
+    }
+
+    // check for UNLOAD command: "UNLOAD:<password>"
+    if (strncmp(buf, "UNLOAD:", 7) == 0) {
+        if (!password_set) {
+            printk(KERN_WARNING "gsm: UNLOAD denied — password not set yet.\n");
+            return -EACCES;
+        }
+        calculate_sha256(buf + 7, attempt_hash);
+        if (memcmp(attempt_hash, gsm_password_hash, 32) == 0) {
+            printk(KERN_INFO "gsm: UNLOAD authorized. module self-lock released. rmmod is now allowed.\n");
+            module_put(THIS_MODULE); // release the self-reference to allow rmmod
+        } else {
+            printk(KERN_WARNING "gsm: UNLOAD denied — incorrect password.\n");
+        }
+        return count;
     }
 
     // password logic
@@ -240,8 +299,15 @@ static int is_file_malicious(const char *filename) {
 asmlinkage long gsm_execve(const struct pt_regs *regs) {
     char __user *filename = (char *)regs->di;
     char buf[256];
-    
-    if (copy_from_user(buf, filename, sizeof(buf)) == 0) {
+    long len;
+
+    // strncpy_from_user is the correct function for userspace strings:
+    // it copies up to N-1 bytes, guarantees null termination, and returns the length
+    // or a negative error code. copy_from_user() blindly copies N bytes without
+    // checking if the string is shorter, risking reading garbage into buf.
+    len = strncpy_from_user(buf, filename, sizeof(buf) - 1);
+    if (len > 0) {
+        buf[len] = '\0';
         if (is_file_malicious(buf)) {
             printk(KERN_ALERT "gsm [block] execve: %s (threat detected)\n", buf);
             gsm_notify_daemon(buf, 2); 
@@ -254,8 +320,12 @@ asmlinkage long gsm_execve(const struct pt_regs *regs) {
 asmlinkage long gsm_execveat(const struct pt_regs *regs) {
     char __user *filename = (char *)regs->si; 
     char buf[256];
-    
-    if (copy_from_user(buf, filename, sizeof(buf)) == 0) {
+    long len;
+
+    // same rationale as gsm_execve — use strncpy_from_user
+    len = strncpy_from_user(buf, filename, sizeof(buf) - 1);
+    if (len > 0) {
+        buf[len] = '\0';
         if (is_file_malicious(buf)) {
             printk(KERN_ALERT "gsm [block] execveat: %s (threat detected)\n", buf);
             gsm_notify_daemon(buf, 2); 
@@ -290,13 +360,17 @@ static int is_current_process_suspect(void) {
 asmlinkage long gsm_unlinkat(const struct pt_regs *regs) {
     char __user *filename = (char *)regs->si;
     char buf[256];
-    
+    long len;
+
     // if the one deleting is the daemon itself, we allow it (necessary for quarantine)
     if (strcmp(current->comm, "gsmc") == 0) {
         return original_unlinkat(regs);
     }
 
-    if (copy_from_user(buf, filename, sizeof(buf)) == 0) {
+    // same rationale as gsm_execve — use strncpy_from_user
+    len = strncpy_from_user(buf, filename, sizeof(buf) - 1);
+    if (len > 0) {
+        buf[len] = '\0';
         // always block if it's a file marked as malicious
         if (is_file_malicious(buf)) {
             return -EACCES;
@@ -385,7 +459,86 @@ asmlinkage long gsm_write(const struct pt_regs *regs) {
     return original_write(regs);
 }
 
-// memory manipulation (cr0) 
+// ─── NETWORK MONITORING HOOKS ───
+// Helper: reads the destination IP+port from a userspace sockaddr and formats
+// it as a human-readable string (e.g. "192.168.1.1:4444").
+static void format_addr(const struct sockaddr __user *uaddr, int addrlen, char *out, size_t outsz) {
+    struct sockaddr_storage kaddr;
+    if (addrlen <= 0 || (size_t)addrlen > sizeof(kaddr)) {
+        snprintf(out, outsz, "<unknown>");
+        return;
+    }
+    if (copy_from_user(&kaddr, uaddr, addrlen)) {
+        snprintf(out, outsz, "<copy_error>");
+        return;
+    }
+    if (((struct sockaddr *)&kaddr)->sa_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)&kaddr;
+        snprintf(out, outsz, "%pI4:%d",
+                 &sin->sin_addr.s_addr,
+                 ntohs(sin->sin_port));
+    } else if (((struct sockaddr *)&kaddr)->sa_family == AF_INET6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&kaddr;
+        snprintf(out, outsz, "[%pI6c]:%d",
+                 &sin6->sin6_addr,
+                 ntohs(sin6->sin6_port));
+    } else {
+        snprintf(out, outsz, "af:%d", ((struct sockaddr *)&kaddr)->sa_family);
+    }
+}
+
+// Hook for connect() — blocks TCP/UDP connections from suspect processes.
+// This prevents reverse shells and C2 communication.
+asmlinkage long gsm_connect(const struct pt_regs *regs) {
+    // int sockfd = (int)regs->di  (unused)
+    struct sockaddr __user *uaddr = (struct sockaddr __user *)regs->si;
+    int addrlen = (int)regs->dx;
+    char addr_str[80];
+    char event_str[256];
+
+    // Allow the gsmc daemon itself to connect freely (e.g. future telemetry)
+    if (strcmp(current->comm, "gsmc") == 0)
+        return original_connect(regs);
+
+    if (is_current_process_suspect()) {
+        format_addr(uaddr, addrlen, addr_str, sizeof(addr_str));
+        snprintf(event_str, sizeof(event_str), "%s -> %s", current->comm, addr_str);
+        printk(KERN_ALERT "gsm [NETWORK BLOCK] connect() from suspect PID %d (%s) to %s — BLOCKED\n",
+               current->pid, current->comm, addr_str);
+        gsm_notify_daemon(event_str, 4); // 4 = network block
+        return -EACCES;
+    }
+    return original_connect(regs);
+}
+
+// Hook for sendto() — blocks raw/UDP data exfiltration from suspect processes.
+// sendto() bypasses connect(), so both must be hooked.
+asmlinkage long gsm_sendto(const struct pt_regs *regs) {
+    // int sockfd    = (int)regs->di
+    // void *buf     = (void *)regs->si
+    // size_t len    = (size_t)regs->dx
+    // int flags     = (int)regs->r10
+    struct sockaddr __user *uaddr = (struct sockaddr __user *)regs->r8;
+    int addrlen = (int)regs->r9;
+    char addr_str[80];
+    char event_str[256];
+
+    if (strcmp(current->comm, "gsmc") == 0)
+        return original_sendto(regs);
+
+    if (uaddr && is_current_process_suspect()) {
+        format_addr(uaddr, addrlen, addr_str, sizeof(addr_str));
+        snprintf(event_str, sizeof(event_str), "%s -sendto-> %s", current->comm, addr_str);
+        printk(KERN_ALERT "gsm [NETWORK BLOCK] sendto() from suspect PID %d (%s) to %s — BLOCKED\n",
+               current->pid, current->comm, addr_str);
+        gsm_notify_daemon(event_str, 4);
+        return -EACCES;
+    }
+    return original_sendto(regs);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+
 static inline void write_forced_cr0(unsigned long val) {
     asm volatile("mov %0, %%cr0" : : "r" (val) : "memory");
 }
@@ -437,9 +590,19 @@ static int __init gsm_init(void) {
     
     original_execveat = (t_sys_execveat)sys_call_table_ptr[TARGET_SYSCALL_EXECVEAT];
     sys_call_table_ptr[TARGET_SYSCALL_EXECVEAT] = (unsigned long)gsm_execveat;
+
+    // network monitoring hooks — block suspect processes from reaching the network
+    original_connect = (t_sys_connect)sys_call_table_ptr[TARGET_SYSCALL_CONNECT];
+    sys_call_table_ptr[TARGET_SYSCALL_CONNECT] = (unsigned long)gsm_connect;
+
+    original_sendto = (t_sys_sendto)sys_call_table_ptr[TARGET_SYSCALL_SENDTO];
+    sys_call_table_ptr[TARGET_SYSCALL_SENDTO] = (unsigned long)gsm_sendto;
     
     protect_memory();
-    printk(KERN_INFO "gsm: general security manager started and locked.\n");
+    // [BUG FIX #3] Prevent rmmod without password by incrementing module refcount.
+    // To unload: echo -n "UNLOAD:<password>" | sudo tee /proc/gsm_control && sudo rmmod gsm
+    try_module_get(THIS_MODULE);
+    printk(KERN_INFO "gsm: general security manager started and locked. rmmod is blocked until UNLOAD command.\n");
     return 0;
 }
 
@@ -452,9 +615,14 @@ static void __exit gsm_exit(void) {
     sys_call_table_ptr[TARGET_SYSCALL_WRITE] = (unsigned long)original_write;
     sys_call_table_ptr[TARGET_SYSCALL_EXECVE] = (unsigned long)original_execve;
     sys_call_table_ptr[TARGET_SYSCALL_EXECVEAT] = (unsigned long)original_execveat;
+    sys_call_table_ptr[TARGET_SYSCALL_CONNECT] = (unsigned long)original_connect;
+    sys_call_table_ptr[TARGET_SYSCALL_SENDTO] = (unsigned long)original_sendto;
     protect_memory();
     
-    del_timer(&unlock_timer);
+    // [BUG FIX #4] Use del_timer_sync instead of del_timer.
+    // del_timer() doesn't wait for a running callback to finish.
+    // If the timer fires during rmmod, it would access freed module memory → kernel panic.
+    del_timer_sync(&unlock_timer);
     remove_proc_entry("gsm_control", NULL);
     
     device_destroy(gsm_class, MKDEV(major_number, 0));
